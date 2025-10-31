@@ -181,25 +181,33 @@ void process_natmap(cJSON *natmap_config, const char *secret_id, const char *sec
             write_to_file(cache_file, current_ip_port);
             // --- End Caching Logic ---
 
-            // 1. Render template if configured
-            const char *template_file = cJSON_GetStringValue(cJSON_GetObjectItem(instance, "TemplateFile"));
-            const char *password = cJSON_GetStringValue(cJSON_GetObjectItem(instance, "Password"));
-            const char *save_path = cJSON_GetStringValue(cJSON_GetObjectItem(instance, "SavePath"));
-            if (template_file && strlen(template_file) > 0 && save_path && strncmp(save_path, "cos://", 6) == 0) {
-                char *rendered_content = render_template(template_file, public_ip, public_port, password);
-                if (rendered_content) {
-                    printf("Natmap: Template rendered successfully in memory.\n");
-                    // Upload to COS
-                    char *cos_path = strdup(save_path + 6); // Skip "cos://"
-                    char *object_key = strchr(cos_path, '/');
-                    if (object_key) {
-                        *object_key = '\0';
-                        object_key++;
-                        printf("Natmap: Uploading content to COS bucket '%s' as '%s'\n", cos_bucket, object_key);
-                        upload_to_cos(secret_id, secret_key, cos_region, cos_bucket, object_key, rendered_content);
+            cJSON *render_files = cJSON_GetObjectItem(instance, "RenderFiles");
+            cJSON *render_file = NULL;
+            cJSON_ArrayForEach(render_file, render_files) {
+                if (!cJSON_IsTrue(cJSON_GetObjectItem(render_file, "Enable"))) {
+                    printf("render_file is disabled.\n");
+                    continue;
+                }
+                // 1. Render template if configured
+                const char *template_file = cJSON_GetStringValue(cJSON_GetObjectItem(render_file, "TemplateFile"));
+                const char *password = cJSON_GetStringValue(cJSON_GetObjectItem(render_file, "Password"));
+                const char *save_path = cJSON_GetStringValue(cJSON_GetObjectItem(render_file, "SavePath"));
+                if (template_file && strlen(template_file) > 0 && save_path && strncmp(save_path, "cos://", 6) == 0) {
+                    char *rendered_content = render_template(template_file, public_ip, public_port, password);
+                    if (rendered_content) {
+                        printf("Natmap: Template rendered successfully in memory.\n");
+                        // Upload to COS
+                        char *cos_path = strdup(save_path + 6); // Skip "cos://"
+                        char *object_key = strchr(cos_path, '/');
+                        if (object_key) {
+                            *object_key = '\0';
+                            object_key++;
+                            printf("Natmap: Uploading content to COS bucket '%s' as '%s'\n", cos_bucket, object_key);
+                            upload_to_cos(secret_id, secret_key, cos_region, cos_bucket, object_key, rendered_content);
+                        }
+                        free(cos_path);
+                        free(rendered_content);
                     }
-                    free(cos_path);
-                    free(rendered_content);
                 }
             }
 
