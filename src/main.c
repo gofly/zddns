@@ -3,17 +3,23 @@
 #include <string.h>
 #include <unistd.h> // for sleep()
 #include <curl/curl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <fcntl.h>
+#include <sys/time.h>
+#include <pthread.h>
 #include <cjson/cJSON.h>
 #include "ddns.h"
 #include "natmap.h"
 #include "cos.h"
 #include "template.h"
 
-// Compile: gcc -o zddns main.c ddns.c natmap.c cos.c template.c -I./cJSON -L./cJSON -lcjson -lcurl -lssl -lcrypto -lm
+// Compile: gcc -o zddns main.c ddns.c natmap.c cos.c template.c -I./cJSON -L./cJSON -lcjson -lcurl -lssl -lcrypto -lm -pthread
 // Usage:
 //   # run:
 //   ./zddns /path/to/config.json
 
+int start_http_server(unsigned int port);
 void process_ddns(cJSON *ddns_config);
 void process_natmap(cJSON *natmap_config, const char *secret_id, const char *secret_key);
 
@@ -42,6 +48,146 @@ static int write_to_file(const char* filepath, const char* content) {
     fprintf(f, "%s", content);
     fclose(f);
     return 0;
+}
+
+// Data to be passed to the HTTP connection handler thread
+typedef struct {
+    int client_sock;
+    cJSON *natmap_config;
+} http_thread_data_t;
+
+// Data for the background task threads
+typedef struct {
+    unsigned int interval;
+    cJSON *config;
+    const char *secret_id;  // For natmap
+    const char *secret_key; // For natmap
+} task_thread_data_t;
+
+// Thread function for the DDNS task
+void *ddns_thread_func(void *arg) {
+    task_thread_data_t *data = (task_thread_data_t *)arg;
+    if (data->interval == 0) return NULL; // Do not run if interval is 0
+
+    while (1) {
+        printf("\n--- Running DDNS Check ---\n");
+        process_ddns(data->config);
+        sleep(data->interval);
+    }
+}
+
+// Thread function to handle an incoming HTTP connection
+void *http_connection_thread(void *arg) {
+    http_thread_data_t *thread_data = (http_thread_data_t *)arg;
+    int client_sock = thread_data->client_sock;
+    cJSON *natmap_config = thread_data->natmap_config;
+    free(thread_data); // Free the thread data struct
+
+    char buffer[2048] = {0};
+    recv(client_sock, buffer, sizeof(buffer) - 1, 0);
+
+    // Very basic HTTP request parsing
+    char *method = strtok(buffer, " ");
+    char *url = strtok(NULL, " ");
+
+    if (method && url && strcmp(method, "GET") == 0) {
+        char *query_path = strtok(url, "?"); // `strtok` modifies the string, which is fine here
+        char *query_string = strtok(NULL, "");
+
+        if (query_path && strcmp(query_path, "/api/natmap/instance") == 0) {
+            int local_port = 0;
+            if (query_string) {
+                char *param = strstr(query_string, "local_port=");
+                if (param) {
+                    local_port = atoi(param + strlen("local_port="));
+                }
+            }
+
+            if (local_port > 0) {
+                char public_ip[40];
+                int public_port;
+                const char *natmap_dir = cJSON_GetStringValue(cJSON_GetObjectItem(natmap_config, "InstancePath"));
+                const char *protocol = "tcp"; // Assume TCP if not specified
+
+                int found = find_natmap_entry(natmap_dir, protocol, local_port, public_ip, sizeof(public_ip), &public_port);
+
+                char response_body[128];
+                char http_response[512];
+
+                if (found == 0) { // Found
+                    snprintf(response_body, sizeof(response_body), "%s:%d", public_ip, public_port);
+                    snprintf(http_response, sizeof(http_response),
+                             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n%s",
+                             strlen(response_body), response_body);
+                } else if (found == 1) { // Not found
+                    strcpy(response_body, "Not Found");
+                    snprintf(http_response, sizeof(http_response),
+                             "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n%s",
+                             strlen(response_body), response_body);
+                } else { // Error
+                    strcpy(response_body, "Internal Server Error");
+                    snprintf(http_response, sizeof(http_response),
+                             "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n%s",
+                             strlen(response_body), response_body);
+                }
+                write(client_sock, http_response, strlen(http_response));
+            } else {
+                const char *bad_request_body = "Bad Request: Missing or invalid local_port";
+                char http_response[256];
+                snprintf(http_response, sizeof(http_response),
+                         "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n%s",
+                         strlen(bad_request_body), bad_request_body);
+                write(client_sock, http_response, strlen(http_response));
+            }
+        } else {
+            const char *not_found_body = "Not Found";
+            char http_response[256];
+            snprintf(http_response, sizeof(http_response),
+                     "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n%s",
+                     strlen(not_found_body), not_found_body);
+            write(client_sock, http_response, strlen(http_response));
+        }
+    }
+
+    close(client_sock);
+    return NULL;
+}
+
+// Starts a non-blocking HTTP server and returns the listening socket fd
+int start_http_server(unsigned int port) {
+    int server_fd;
+    struct sockaddr_in address;
+    int opt = 1;
+
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("socket failed");
+        return -1;
+    }
+
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+        perror("setsockopt");
+        close(server_fd);
+        return -1;
+    }
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("bind failed");
+        close(server_fd);
+        return -1;
+    }
+
+    if (listen(server_fd, 10) < 0) {
+        perror("listen");
+        close(server_fd);
+        return -1;
+    }
+
+    printf("HTTP API server listening on port %u\n", port);
+    return server_fd;
 }
 
 void process_ddns(cJSON *ddns_config) {
@@ -247,6 +393,17 @@ void process_natmap(cJSON *natmap_config, const char *secret_id, const char *sec
     }
 }
 
+void *natmap_thread_func(void *arg) {
+    task_thread_data_t *data = (task_thread_data_t *)arg;
+    if (data->interval == 0) return NULL; // Do not run if interval is 0
+
+    while (1) {
+        printf("\n--- Running Natmap Check ---\n");
+        process_natmap(data->config, data->secret_id, data->secret_key);
+        sleep(data->interval);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s /path/to/config.json\n", argv[0]);
@@ -266,14 +423,17 @@ int main(int argc, char **argv) {
         return 5;
     } 
 
+    cJSON *http_config = cJSON_GetObjectItem(config_json, "HTTP");
     cJSON *ddns_config = cJSON_GetObjectItem(config_json, "DDNS");
     cJSON *natmap_config = cJSON_GetObjectItem(config_json, "Natmap");
 
-    if (!ddns_config || !natmap_config) {
-        fprintf(stderr, "Config file must contain 'DDNS' and 'Natmap' sections.\n");
+    if (!ddns_config && !natmap_config && !http_config) {
+        fprintf(stderr, "Config file must contain 'HTTP', 'DDNS' and 'Natmap' sections.\n");
         cJSON_Delete(config_json);
         return 6;
     }
+
+    unsigned int http_listen_port = (unsigned int)cJSON_GetNumberValue(cJSON_GetObjectItem(http_config, "ListenPort"));
 
     // Get credentials from DDNS section, as they are shared
     const char *secret_id = cJSON_GetStringValue(cJSON_GetObjectItem(ddns_config, "SecretID"));
@@ -282,26 +442,79 @@ int main(int argc, char **argv) {
     unsigned int ddns_interval = (unsigned int)cJSON_GetNumberValue(cJSON_GetObjectItem(ddns_config, "Interval"));
     unsigned int natmap_interval = (unsigned int)cJSON_GetNumberValue(cJSON_GetObjectItem(natmap_config, "Interval"));
 
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-
-    time_t last_ddns_check = 0;
-    time_t last_natmap_check = 0;
-
-    while (1) {
-        time_t now = time(NULL);
-        if (now - last_ddns_check >= ddns_interval) {
-            printf("\n--- Running DDNS Check ---\n");
-            process_ddns(ddns_config);
-            last_ddns_check = now;
-        }
-        if (now - last_natmap_check >= natmap_interval) {
-            printf("\n--- Running Natmap Check ---\n");
-            process_natmap(natmap_config, secret_id, secret_key);
-            last_natmap_check = now;
-        }
-        sleep(10);
+    int http_server_fd = -1;
+    if (http_config && http_listen_port > 0 && http_listen_port <= 65535) {
+        http_server_fd = start_http_server(http_listen_port);
+    } else {
+        printf("HTTP API module is disabled.\n");
     }
 
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    // --- Start background tasks in their own threads ---
+    pthread_t ddns_tid, natmap_tid;
+
+    // Use malloc for thread data to ensure it persists after main function scope might change
+    task_thread_data_t *ddns_task_data = malloc(sizeof(task_thread_data_t));
+    *ddns_task_data = (task_thread_data_t){
+        .interval = ddns_interval,
+        .config = ddns_config
+    };
+    if (cJSON_IsTrue(cJSON_GetObjectItem(ddns_config, "Enable"))) {
+        pthread_create(&ddns_tid, NULL, ddns_thread_func, ddns_task_data);
+        pthread_detach(ddns_tid);
+    }
+
+    task_thread_data_t *natmap_task_data = malloc(sizeof(task_thread_data_t));
+    *natmap_task_data = (task_thread_data_t){
+        .interval = natmap_interval,
+        .config = natmap_config,
+        .secret_id = secret_id,
+        .secret_key = secret_key
+    };
+    if (cJSON_IsTrue(cJSON_GetObjectItem(natmap_config, "Enable"))) {
+        pthread_create(&natmap_tid, NULL, natmap_thread_func, natmap_task_data);
+        pthread_detach(natmap_tid);
+    }
+
+    // --- Main thread loop: only handles HTTP server ---
+    while (1) {
+        // If HTTP server is not running, just sleep to prevent busy-waiting
+        if (http_server_fd == -1) {
+            sleep(3600); // Sleep for a long time
+            continue;
+        }
+
+        // The main loop now only cares about accepting new connections.
+        // It will block here until a new connection arrives.
+        int client_sock = accept(http_server_fd, NULL, NULL);
+        if (client_sock >= 0) {
+            pthread_t tid;
+            http_thread_data_t *thread_data = malloc(sizeof(http_thread_data_t));
+            if (thread_data) {
+                thread_data->client_sock = client_sock;
+                thread_data->natmap_config = natmap_config;
+                if (pthread_create(&tid, NULL, http_connection_thread, thread_data) != 0) {
+                    perror("pthread_create failed");
+                    free(thread_data);
+                    close(client_sock);
+                }
+                pthread_detach(tid); // Detach the thread to auto-reap its resources
+            }
+        } else {
+            // On a blocking socket, accept() failing is usually a real issue.
+            perror("accept failed");
+            break; // Exit loop on accept error
+        }
+    }
+
+    if (http_server_fd != -1) {
+        close(http_server_fd);
+    }
+    // In a real-world daemon, you'd signal threads to exit gracefully here.
+    // For this app, letting the process exit is sufficient.
+    free(ddns_task_data);
+    free(natmap_task_data);
     cJSON_Delete(config_json);
     curl_global_cleanup();
     return 0;

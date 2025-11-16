@@ -1,6 +1,6 @@
 CFLAGS+=-Wall -Wextra -O2 -I/usr/local/include
 LDFLAGS+=-L/usr/local/lib
-LIBS=-lcjson -lcurl -lssl -lcrypto -lm
+LIBS=-lcjson -lcurl -lssl -lcrypto -lm -pthread
 OBJS=main.o cos.o ddns.o json.o natmap.o template.o
 
 %.o: %.c
