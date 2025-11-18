@@ -21,7 +21,7 @@
 
 int start_http_server(unsigned int port);
 void process_ddns(cJSON *ddns_config, const char *secret_id, const char *secret_key);
-void process_natmap(cJSON *natmap_config, const char *secret_id, const char *secret_key);
+void process_natmap(cJSON *natmap_config, const char *secret_id, const char *secret_key, const char *cos_region, const char *cos_bucket);
 
 // read file content into a string
 static char* read_file_content(const char *filename) {
@@ -62,6 +62,8 @@ typedef struct {
     cJSON *config;
     const char *secret_id;  // For natmap
     const char *secret_key; // For natmap
+    const char *cos_region; // For natmap
+    const char *cos_bucket; // For natmap
 } task_thread_data_t;
 
 // Thread function for the DDNS task
@@ -271,16 +273,12 @@ void process_ddns(cJSON *ddns_config, const char *secret_id, const char *secret_
     if (cached_ip) free(cached_ip);
 }
 
-void process_natmap(cJSON *natmap_config, const char *secret_id, const char *secret_key) {
+void process_natmap(cJSON *natmap_config, const char *secret_id, const char *secret_key, const char *cos_region, const char *cos_bucket) {
     if (!cJSON_IsTrue(cJSON_GetObjectItem(natmap_config, "Enable"))) {
         printf("Natmap module is disabled.\n");
         return;
     }
 
-    cJSON *cos_config = cJSON_GetObjectItem(natmap_config, "COS");
-    const char *cos_region = cJSON_GetStringValue(cJSON_GetObjectItem(cos_config, "Region"));
-    const char *cos_bucket = cJSON_GetStringValue(cJSON_GetObjectItem(cos_config, "Bucket"));
-    
     const char *instance_path = cJSON_GetStringValue(cJSON_GetObjectItem(natmap_config, "InstancePath"));
     const char *temp_path = cJSON_GetStringValue(cJSON_GetObjectItem(natmap_config, "TempPath"));
     cJSON *instances = cJSON_GetObjectItem(natmap_config, "Instances");
@@ -406,7 +404,7 @@ void *natmap_thread_func(void *arg) {
 
     while (1) {
         printf("\n--- Running Natmap Check ---\n");
-        process_natmap(data->config, data->secret_id, data->secret_key);
+        process_natmap(data->config, data->secret_id, data->secret_key, data->cos_region, data->cos_bucket);
         sleep(data->interval);
     }
 }
@@ -435,17 +433,22 @@ int main(int argc, char **argv) {
     cJSON *ddns_config = cJSON_GetObjectItem(config_json, "DDNS");
     cJSON *natmap_config = cJSON_GetObjectItem(config_json, "Natmap");
 
-    if (!ddns_config && !natmap_config && !http_config) {
-        fprintf(stderr, "Config file must contain 'HTTP', 'DDNS' and 'Natmap' sections.\n");
+    if (!ddns_config || !natmap_config || !http_config || !tencent_cloud_config) {
+        fprintf(stderr, "Config file must contain 'HTTP', 'DDNS', 'TencentCloud' and 'Natmap' sections.\n");
         cJSON_Delete(config_json);
         return 6;
     }
+
+    cJSON *cos_config = cJSON_GetObjectItem(tencent_cloud_config, "COS");
+    const char *cos_region = cos_config?cJSON_GetStringValue(cJSON_GetObjectItem(cos_config, "Region")):NULL;
+    const char *cos_bucket = cos_config?cJSON_GetStringValue(cJSON_GetObjectItem(cos_config, "Bucket")):NULL;
 
     unsigned int http_listen_port = (unsigned int)cJSON_GetNumberValue(cJSON_GetObjectItem(http_config, "ListenPort"));
 
     // Get credentials from DDNS section, as they are shared
     const char *secret_id = cJSON_GetStringValue(cJSON_GetObjectItem(tencent_cloud_config, "SecretID"));
     const char *secret_key = cJSON_GetStringValue(cJSON_GetObjectItem(tencent_cloud_config, "SecretKey"));
+
 
     unsigned int ddns_interval = (unsigned int)cJSON_GetNumberValue(cJSON_GetObjectItem(ddns_config, "Interval"));
     unsigned int natmap_interval = (unsigned int)cJSON_GetNumberValue(cJSON_GetObjectItem(natmap_config, "Interval"));
@@ -468,7 +471,9 @@ int main(int argc, char **argv) {
         .interval = ddns_interval,
         .config = ddns_config,
         .secret_id = secret_id,
-        .secret_key = secret_key
+        .secret_key = secret_key,
+        .cos_region = cos_region,
+        .cos_bucket = cos_bucket
     };
     if (cJSON_IsTrue(cJSON_GetObjectItem(ddns_config, "Enable"))) {
         pthread_create(&ddns_tid, NULL, ddns_thread_func, ddns_task_data);
@@ -480,7 +485,9 @@ int main(int argc, char **argv) {
         .interval = natmap_interval,
         .config = natmap_config,
         .secret_id = secret_id,
-        .secret_key = secret_key
+        .secret_key = secret_key,
+        .cos_region = cos_region,
+        .cos_bucket = cos_bucket
     };
     if (cJSON_IsTrue(cJSON_GetObjectItem(natmap_config, "Enable"))) {
         pthread_create(&natmap_tid, NULL, natmap_thread_func, natmap_task_data);
