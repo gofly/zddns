@@ -20,7 +20,7 @@
 //   ./zddns /path/to/config.json
 
 int start_http_server(unsigned int port);
-void process_ddns(cJSON *ddns_config);
+void process_ddns(cJSON *ddns_config, const char *secret_id, const char *secret_key);
 void process_natmap(cJSON *natmap_config, const char *secret_id, const char *secret_key);
 
 // read file content into a string
@@ -71,7 +71,7 @@ void *ddns_thread_func(void *arg) {
 
     while (1) {
         printf("\n--- Running DDNS Check ---\n");
-        process_ddns(data->config);
+        process_ddns(data->config, data->secret_id, data->secret_key);
         sleep(data->interval);
     }
 }
@@ -115,7 +115,7 @@ void *http_connection_thread(void *arg) {
                 char http_response[512];
 
                 if (found == 0) { // Found
-                    snprintf(response_body, sizeof(response_body), "%s:%d", public_ip, public_port);
+                    snprintf(response_body, sizeof(response_body), "{\"local_port\":%d,\"public_ip\":\"%s\",\"public_port\":%d}\n", local_port, public_ip, public_port);
                     snprintf(http_response, sizeof(http_response),
                              "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n%s",
                              strlen(response_body), response_body);
@@ -190,14 +190,12 @@ int start_http_server(unsigned int port) {
     return server_fd;
 }
 
-void process_ddns(cJSON *ddns_config) {
+void process_ddns(cJSON *ddns_config, const char *secret_id, const char *secret_key) {
     if (!cJSON_IsTrue(cJSON_GetObjectItem(ddns_config, "Enable"))) {
         printf("DDNS module is disabled.\n");
         return;
     }
 
-    const char *secret_id = cJSON_GetStringValue(cJSON_GetObjectItem(ddns_config, "SecretID"));
-    const char *secret_key = cJSON_GetStringValue(cJSON_GetObjectItem(ddns_config, "SecretKey"));
     const char *domain = cJSON_GetStringValue(cJSON_GetObjectItem(ddns_config, "Domain"));
     const char *sub_domain = cJSON_GetStringValue(cJSON_GetObjectItem(ddns_config, "SubDomain"));
     const char *record_type = cJSON_GetStringValue(cJSON_GetObjectItem(ddns_config, "RecordType"));
@@ -284,6 +282,7 @@ void process_natmap(cJSON *natmap_config, const char *secret_id, const char *sec
     const char *cos_bucket = cJSON_GetStringValue(cJSON_GetObjectItem(cos_config, "Bucket"));
     
     const char *instance_path = cJSON_GetStringValue(cJSON_GetObjectItem(natmap_config, "InstancePath"));
+    const char *temp_path = cJSON_GetStringValue(cJSON_GetObjectItem(natmap_config, "TempPath"));
     cJSON *instances = cJSON_GetObjectItem(natmap_config, "Instances");
     cJSON *instance = NULL;
 
@@ -304,7 +303,7 @@ void process_natmap(cJSON *natmap_config, const char *secret_id, const char *sec
 
             // --- Caching Logic ---
             char cache_file[256];
-            snprintf(cache_file, sizeof(cache_file), "/tmp/zddns_natmap_%s_%d.cache", protocol, local_port);
+            snprintf(cache_file, sizeof(cache_file), "%s/zddns_natmap_%s_%d.cache", temp_path, protocol, local_port);
 
             char cached_ip_port[64] = {0};
             char current_ip_port[64];
@@ -366,7 +365,15 @@ void process_natmap(cJSON *natmap_config, const char *secret_id, const char *sec
                 printf("Natmap: Updating DDNS for %s/%d...\n", protocol, local_port);
                 cJSON *body = cJSON_CreateObject();
                 cJSON_AddStringToObject(body, "Domain", cJSON_GetStringValue(cJSON_GetObjectItem(ddns_conf, "Domain")));
-                cJSON_AddStringToObject(body, "SubDomain", cJSON_GetStringValue(cJSON_GetObjectItem(ddns_conf, "SubDomain")));
+                const char* sub_domain = cJSON_GetStringValue(cJSON_GetObjectItem(ddns_conf, "SubDomain"));
+                char port_str[16];
+                snprintf(port_str, sizeof(port_str), "%d", public_port);
+                const char* sub_domain_after_port = str_replace(sub_domain, "{{.ExternalPort}}", port_str);
+                if (!sub_domain_after_port) {
+                    fprintf(stderr, "Failed to replace Port in template\n");
+                    sub_domain_after_port = sub_domain; // Fallback to original
+                }
+                cJSON_AddStringToObject(body, "SubDomain", sub_domain_after_port);
                 cJSON_AddNumberToObject(body, "RecordId", cJSON_GetNumberValue(cJSON_GetObjectItem(ddns_conf, "RecordId")));
                 cJSON_AddStringToObject(body, "RecordType", cJSON_GetStringValue(cJSON_GetObjectItem(ddns_conf, "RecordType")));
                 cJSON_AddStringToObject(body, "RecordLine", cJSON_GetStringValue(cJSON_GetObjectItem(ddns_conf, "RecordLine")));
@@ -380,7 +387,7 @@ void process_natmap(cJSON *natmap_config, const char *secret_id, const char *sec
                 
                 char *body_str = cJSON_PrintUnformatted(body);
                 if (do_update_dns(body_str, secret_id, secret_key, NULL, NULL) != 0) {
-                    fprintf(stderr, "Natmap: DDNS update for %s failed.\n", cJSON_GetStringValue(cJSON_GetObjectItem(ddns_conf, "SubDomain")));
+                    fprintf(stderr, "Natmap: DDNS update for %s failed.\n", sub_domain_after_port);
                 }
                 free(body_str);
                 cJSON_Delete(body);
@@ -424,6 +431,7 @@ int main(int argc, char **argv) {
     } 
 
     cJSON *http_config = cJSON_GetObjectItem(config_json, "HTTP");
+    cJSON *tencent_cloud_config = cJSON_GetObjectItem(config_json, "TencentCloud");
     cJSON *ddns_config = cJSON_GetObjectItem(config_json, "DDNS");
     cJSON *natmap_config = cJSON_GetObjectItem(config_json, "Natmap");
 
@@ -436,8 +444,8 @@ int main(int argc, char **argv) {
     unsigned int http_listen_port = (unsigned int)cJSON_GetNumberValue(cJSON_GetObjectItem(http_config, "ListenPort"));
 
     // Get credentials from DDNS section, as they are shared
-    const char *secret_id = cJSON_GetStringValue(cJSON_GetObjectItem(ddns_config, "SecretID"));
-    const char *secret_key = cJSON_GetStringValue(cJSON_GetObjectItem(ddns_config, "SecretKey"));
+    const char *secret_id = cJSON_GetStringValue(cJSON_GetObjectItem(tencent_cloud_config, "SecretID"));
+    const char *secret_key = cJSON_GetStringValue(cJSON_GetObjectItem(tencent_cloud_config, "SecretKey"));
 
     unsigned int ddns_interval = (unsigned int)cJSON_GetNumberValue(cJSON_GetObjectItem(ddns_config, "Interval"));
     unsigned int natmap_interval = (unsigned int)cJSON_GetNumberValue(cJSON_GetObjectItem(natmap_config, "Interval"));
@@ -458,7 +466,9 @@ int main(int argc, char **argv) {
     task_thread_data_t *ddns_task_data = malloc(sizeof(task_thread_data_t));
     *ddns_task_data = (task_thread_data_t){
         .interval = ddns_interval,
-        .config = ddns_config
+        .config = ddns_config,
+        .secret_id = secret_id,
+        .secret_key = secret_key
     };
     if (cJSON_IsTrue(cJSON_GetObjectItem(ddns_config, "Enable"))) {
         pthread_create(&ddns_tid, NULL, ddns_thread_func, ddns_task_data);

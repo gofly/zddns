@@ -20,7 +20,7 @@ static char* read_file_content(const char *filename) {
 }
 
 // Simple string replacement function
-static char *str_replace(const char *orig, const char *rep, const char *with) {
+char *str_replace(const char *orig, const char *rep, const char *with) {
     char *result;
     const char *ins;
     char *tmp;
