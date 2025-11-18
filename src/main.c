@@ -116,11 +116,41 @@ void *http_connection_thread(void *arg) {
                 char response_body[128];
                 char http_response[512];
 
-                if (found == 0) { // Found
-                    snprintf(response_body, sizeof(response_body), "{\"local_port\":%d,\"public_ip\":\"%s\",\"public_port\":%d}\n", local_port, public_ip, public_port);
+                if (found == 0) { // Entry found
+                    cJSON *response_json = cJSON_CreateObject();
+                    cJSON_AddNumberToObject(response_json, "local_port", local_port);
+                    cJSON_AddStringToObject(response_json, "public_ip", public_ip);
+                    cJSON_AddNumberToObject(response_json, "public_port", public_port);
+
+                    // Now, find the corresponding instance in config to get the domain
+                    cJSON *instances = cJSON_GetObjectItem(natmap_config, "Instances");
+                    cJSON *instance = NULL;
+                    cJSON_ArrayForEach(instance, instances) {
+                        if ((int)cJSON_GetNumberValue(cJSON_GetObjectItem(instance, "LocalPort")) == local_port) {
+                            cJSON *ddns_conf = cJSON_GetObjectItem(instance, "DDNS");
+                            if (ddns_conf && cJSON_IsTrue(cJSON_GetObjectItem(ddns_conf, "Enable"))) {
+                                const char *sub_domain_tpl = cJSON_GetStringValue(cJSON_GetObjectItem(ddns_conf, "SubDomain"));
+                                const char *domain = cJSON_GetStringValue(cJSON_GetObjectItem(ddns_conf, "Domain"));
+                                if (sub_domain_tpl && domain) {
+                                    char port_str[16];
+                                    snprintf(port_str, sizeof(port_str), "%d", public_port);
+                                    char *sub_domain = str_replace(sub_domain_tpl, "{{.ExternalPort}}", port_str);
+                                    char full_domain[256];
+                                    snprintf(full_domain, sizeof(full_domain), "%s.%s", sub_domain, domain);
+                                    cJSON_AddStringToObject(response_json, "domain", full_domain);
+                                    free(sub_domain);
+                                }
+                            }
+                            break; // Found the matching instance, no need to loop further
+                        }
+                    }
+
+                    char *response_body_str = cJSON_PrintUnformatted(response_json);
                     snprintf(http_response, sizeof(http_response),
                              "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n%s",
-                             strlen(response_body), response_body);
+                             strlen(response_body_str), response_body_str);
+                    free(response_body_str);
+                    cJSON_Delete(response_json);
                 } else if (found == 1) { // Not found
                     strcpy(response_body, "Not Found");
                     snprintf(http_response, sizeof(http_response),
