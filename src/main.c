@@ -370,15 +370,9 @@ void process_natmap(cJSON *natmap_config, const char *secret_id, const char *sec
                     if (rendered_content) {
                         printf("Natmap: Template rendered successfully in memory.\n");
                         // Upload to COS
-                        char *cos_path = strdup(save_path + 6); // Skip "cos://"
-                        char *object_key = strchr(cos_path, '/');
-                        if (object_key) {
-                            *object_key = '\0';
-                            object_key++;
-                            printf("Natmap: Uploading content to COS bucket '%s' as '%s'\n", cos_bucket, object_key);
-                            upload_to_cos(secret_id, secret_key, cos_region, cos_bucket, object_key, rendered_content);
-                        }
-                        free(cos_path);
+                        const char *object_key = save_path + strlen("cos:///");
+                        printf("Natmap: Uploading content to COS bucket '%s' as '%s'\n", cos_bucket, object_key);
+                        upload_to_cos(secret_id, secret_key, cos_region, cos_bucket, object_key, rendered_content);
                         free(rendered_content);
                     }
                 }
@@ -393,10 +387,10 @@ void process_natmap(cJSON *natmap_config, const char *secret_id, const char *sec
                 printf("Natmap: Updating DDNS for %s/%d...\n", protocol, local_port);
                 cJSON *body = cJSON_CreateObject();
                 cJSON_AddStringToObject(body, "Domain", cJSON_GetStringValue(cJSON_GetObjectItem(ddns_conf, "Domain")));
-                const char* sub_domain = cJSON_GetStringValue(cJSON_GetObjectItem(ddns_conf, "SubDomain"));
+                char* sub_domain = cJSON_GetStringValue(cJSON_GetObjectItem(ddns_conf, "SubDomain"));
                 char port_str[16];
                 snprintf(port_str, sizeof(port_str), "%d", public_port);
-                const char* sub_domain_after_port = str_replace(sub_domain, "{{.ExternalPort}}", port_str);
+                char* sub_domain_after_port = str_replace(sub_domain, "{{.ExternalPort}}", port_str);
                 if (!sub_domain_after_port) {
                     fprintf(stderr, "Failed to replace Port in template\n");
                     sub_domain_after_port = sub_domain; // Fallback to original
@@ -417,6 +411,8 @@ void process_natmap(cJSON *natmap_config, const char *secret_id, const char *sec
                 if (do_update_dns(body_str, secret_id, secret_key, NULL, NULL) != 0) {
                     fprintf(stderr, "Natmap: DDNS update for %s failed.\n", sub_domain_after_port);
                 }
+                free(sub_domain);
+                free(sub_domain_after_port);
                 free(body_str);
                 cJSON_Delete(body);
 
